@@ -5,15 +5,15 @@ pub struct GameData {
   _priv: (),
 }
 
-impl TryFrom<&'_ [u8]> for GameData {
+impl TryFrom<&[u8]> for GameData {
   type Error = Box<bincode::ErrorKind>;
-  fn try_from(value: &'_ [u8]) -> Result<Self, Self::Error> {
+  fn try_from(value: &[u8]) -> Result<Self, Self::Error> {
     bincode::deserialize(value)
   }
 }
-impl TryFrom<&'_ GameData> for Vec<u8> {
+impl TryFrom<&GameData> for Vec<u8> {
   type Error = Box<bincode::ErrorKind>;
-  fn try_from(value: &'_ GameData) -> Result<Self, Self::Error> {
+  fn try_from(value: &GameData) -> Result<Self, Self::Error> {
     bincode::serialize(value)
   }
 }
