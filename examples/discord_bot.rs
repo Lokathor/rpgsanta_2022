@@ -1,9 +1,9 @@
-use serenity::{
+use serenity::model::channel::Channel;
+pub use serenity::{
   async_trait,
   model::{channel::Message, gateway::Ready},
   prelude::*,
 };
-
 struct Handler;
 
 #[async_trait]
@@ -14,14 +14,29 @@ impl EventHandler for Handler {
   // Event handlers are dispatched through a threadpool, and so multiple
   // events can be dispatched simultaneously.
   async fn message(&self, ctx: Context, msg: Message) {
-    if msg.content == "!ping" {
-      // Sending a message can fail, due to a network error, an
-      // authentication error, or lack of permissions to post in the
-      // channel, so log to stdout when some error happens, with a
-      // description of it.
-      if let Err(why) = msg.channel_id.say(&ctx.http, "Pong!").await {
-        println!("Error sending message: {:?}", why);
+    // currently the bot only supports private message interactions.
+    match msg.channel(&ctx.http).await {
+      Ok(Channel::Private(priv_chan)) => {
+        let recipient = &priv_chan.recipient;
+        let recipient_name = recipient.name.as_str();
+        let recipient_discrim = recipient.discriminator;
+        let they_spoke = recipient_discrim == msg.author.discriminator
+          && recipient_name == msg.author.name.as_str();
+        let msg_dir = if they_spoke { ">" } else { "<" };
+        let content = msg.content.as_str();
+        println!("{recipient_name}#{recipient_discrim}{msg_dir} {content}");
+        //
+        if msg.content == "!ping" {
+          // Sending a message can fail, due to a network error, an
+          // authentication error, or lack of permissions to post in the
+          // channel, so log to stdout when some error happens, with a
+          // description of it.
+          if let Err(why) = msg.channel_id.say(&ctx.http, "Pong!").await {
+            println!("Error sending message: {why:?}");
+          }
+        }
       }
+      _ => return,
     }
   }
 
@@ -32,15 +47,17 @@ impl EventHandler for Handler {
   //
   // In this case, just print what the current user's username is.
   async fn ready(&self, _: Context, ready: Ready) {
-    println!("{} is connected!", ready.user.name);
+    let my_name = ready.user.name.as_str();
+    let my_discriminator = ready.user.discriminator;
+    println!("Connected as {my_name}#{my_discriminator}!");
   }
 }
 
 #[tokio::main]
 async fn main() {
   // Configure the client with your Discord bot token in the environment.
-  let token = std::env::var("DISCORD_TOKEN")
-    .expect("Expected a token in the environment");
+  let token =
+    std::env::var("DISCORD_TOKEN").expect("Expected a `DISCORD_TOKEN` value");
   // Set gateway intents, which decides what events the bot will be notified
   // about
   let intents = GatewayIntents::GUILD_MESSAGES
@@ -60,6 +77,6 @@ async fn main() {
   // Shards will automatically attempt to reconnect, and will perform
   // exponential backoff until it reconnects.
   if let Err(why) = client.start().await {
-    println!("Client error: {:?}", why);
+    println!("Client start error: {why:?}");
   }
 }
