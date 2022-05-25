@@ -1,22 +1,58 @@
-use serenity::model::channel::Channel;
-pub use serenity::{
+#![allow(unused_imports)]
+
+use serenity::{
   async_trait,
-  model::{channel::Message, gateway::Ready},
+  model::{
+    channel::{Channel, Message},
+    gateway::Ready,
+    id::ChannelId,
+  },
   prelude::*,
 };
-struct Handler;
+use std::{
+  collections::{hash_map::Entry, HashMap},
+  sync::Arc,
+  time::Duration,
+};
+use tokio::{
+  sync::{
+    mpsc::{channel as mpsc_channel, Sender as MspcSender},
+    RwLock, RwLockReadGuard, RwLockWriteGuard,
+  },
+  time::timeout,
+};
+
+/// Manages text adventure sessions over discord.
+///
+/// Each channel of interaction is a single game session.
+#[derive(Default)]
+struct TextBot {
+  sessions: Arc<RwLock<HashMap<ChannelId, MspcSender<String>>>>,
+}
 
 #[async_trait]
-impl EventHandler for Handler {
-  // Set a handler for the `message` event - so that whenever a new message
-  // is received - the closure (or function) passed will be called.
-  //
-  // Event handlers are dispatched through a threadpool, and so multiple
-  // events can be dispatched simultaneously.
+impl EventHandler for TextBot {
+  /// This is called when a shard is booted, and a READY payload is sent by
+  /// Discord.
+  async fn ready(&self, _: Context, ready: Ready) {
+    let my_name = ready.user.name.as_str();
+    let my_discriminator = ready.user.discriminator;
+    println!("Connected as {my_name}#{my_discriminator}!");
+  }
+
+  /// This is called for each message the bot sees.
+  ///
+  /// * When others speak it generates a message
+  /// * When the bot speaks it gets events for *its own* messages
+  /// * Events are handled async using a thread pool, so multiple messages can
+  ///   be in flight at the same time.
   async fn message(&self, ctx: Context, msg: Message) {
-    // currently the bot only supports private message interactions.
+    // Currently the bot only supports private message interactions. All other
+    // messages are ignored. This is not a fundamental limit, just a logistical
+    // one.
     match msg.channel(&ctx.http).await {
       Ok(Channel::Private(priv_chan)) => {
+        // debug print what we saw
         let recipient = &priv_chan.recipient;
         let recipient_name = recipient.name.as_str();
         let recipient_discrim = recipient.discriminator;
@@ -25,7 +61,41 @@ impl EventHandler for Handler {
         let msg_dir = if they_spoke { ">" } else { "<" };
         let content = msg.content.as_str();
         println!("{recipient_name}#{recipient_discrim}{msg_dir} {content}");
+        if !they_spoke {
+          return;
+        }
         //
+        let r: RwLockReadGuard<_> = self.sessions.read().await;
+        if let Some(sender) = r.get(&msg.channel_id) {
+          // If there's already a live session, we just put the message into the
+          // channel.
+          if let Err(why) = sender.send(msg.content).await {
+            println!("Error putting message into the session channel: {why:?}");
+          }
+        } else {
+          // When a session isn't found we have to drop our reader and upgrade
+          // to holding the writer.
+          drop(r);
+          let mut w: RwLockWriteGuard<_> = self.sessions.write().await;
+          match w.entry(msg.channel_id) {
+            Entry::Occupied(mut o) => {
+              // It's possible for another event to have made a sender between
+              // when we first checked and now, so we might be able to send.
+              if let Err(why) = o.get_mut().send(content.to_string()).await {
+                println!(
+                  "Error putting message into the session channel: {why:?}"
+                );
+              }
+            }
+            Entry::Vacant(mut v) => {
+              // More likely, there's still no session here so we have to spawn
+              // up all the machinery for it.
+              todo!()
+            }
+          }
+        }
+
+        /*
         if msg.content == "!ping" {
           // Sending a message can fail, due to a network error, an
           // authentication error, or lack of permissions to post in the
@@ -35,21 +105,10 @@ impl EventHandler for Handler {
             println!("Error sending message: {why:?}");
           }
         }
+        */
       }
       _ => return,
     }
-  }
-
-  // Set a handler to be called on the `ready` event. This is called when a
-  // shard is booted, and a READY payload is sent by Discord. This payload
-  // contains data like the current user's guild Ids, current user data,
-  // private channels, and more.
-  //
-  // In this case, just print what the current user's username is.
-  async fn ready(&self, _: Context, ready: Ready) {
-    let my_name = ready.user.name.as_str();
-    let my_discriminator = ready.user.discriminator;
-    println!("Connected as {my_name}#{my_discriminator}!");
   }
 }
 
@@ -68,7 +127,7 @@ async fn main() {
   // automatically prepend your bot token with "Bot ", which is a requirement
   // by Discord for bot users.
   let mut client = Client::builder(&token, intents)
-    .event_handler(Handler)
+    .event_handler(TextBot::default())
     .await
     .expect("Err creating client");
 
