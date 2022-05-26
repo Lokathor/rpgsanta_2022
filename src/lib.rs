@@ -1,8 +1,8 @@
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct GameData {
-  _priv: (),
+  message_count: u64,
 }
 
 impl TryFrom<&[u8]> for GameData {
@@ -19,7 +19,8 @@ impl TryFrom<&GameData> for Vec<u8> {
 }
 
 impl GameData {
-  pub fn new() -> Self {
-    Self { _priv: () }
+  pub fn process_input(&mut self, _line: String) -> String {
+    self.message_count += 1;
+    format!("{}", self.message_count)
   }
 }
