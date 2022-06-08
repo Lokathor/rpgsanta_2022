@@ -3,6 +3,7 @@
 use rpgsanta_2022::GameData;
 use serenity::{
   async_trait,
+  http::Http,
   model::{
     channel::{Channel, Message},
     gateway::Ready,
@@ -17,12 +18,24 @@ use std::{
 };
 use tokio::{
   sync::{
-    mpsc::{channel as mpsc_channel, Sender as MspcSender},
+    mpsc::{
+      channel as mpsc_channel, Receiver as MspcReceiver, Sender as MspcSender,
+    },
     RwLock, RwLockReadGuard, RwLockWriteGuard,
   },
   task::spawn as task_spawn,
   time::timeout,
 };
+
+macro_rules! log_err {
+  ( $x:expr ) => {
+    if let Err(why) = $x {
+      let file = file!();
+      let line = line!();
+      println!("[{file}:{line}$ {why}]");
+    }
+  };
+}
 
 /// Manages text adventure sessions over discord.
 ///
@@ -40,6 +53,39 @@ struct TextBot {
   sessions: Arc<RwLock<HashMap<ChannelId, MspcSender<String>>>>,
 }
 
+async fn perform_game_session(
+  name: String, channel_id: ChannelId, mut recver: MspcReceiver<String>,
+  mut game: GameData,
+  sessions_handle: Arc<RwLock<HashMap<ChannelId, MspcSender<String>>>>,
+  http: Arc<Http>,
+) {
+  const TEN_MIN: Duration = Duration::new(60 * 10, 0);
+
+  let name_str = name.as_str();
+  println!("[Spinning up new session for {name_str}]");
+
+  while let Ok(Some(message)) = timeout(TEN_MIN, recver.recv()).await {
+    // we signal an intent to respond, but if that fails we don't
+    // really care.
+    drop(channel_id.broadcast_typing(&http).await);
+    let game_response = game.process_input(message);
+    log_err!(channel_id.say(&http, game_response.as_str()).await);
+  }
+
+  println!("[Session for {name_str} timed out (or errored), shutting down]");
+  let mut write_lock = sessions_handle.write().await;
+  // close the channel to any new messages
+  recver.close();
+  // pump the channel for all remaining messages (usually none).
+  while let Some(message) = recver.recv().await {
+    drop(channel_id.broadcast_typing(&http).await);
+    let game_response = game.process_input(message);
+    log_err!(channel_id.say(&http, game_response.as_str()).await);
+  }
+  // TODO: write the game to disk while the sessions map is locked.
+  write_lock.remove(&channel_id);
+}
+
 #[async_trait]
 impl EventHandler for TextBot {
   /// This is called when a shard is booted, and a READY payload is sent by
@@ -47,7 +93,7 @@ impl EventHandler for TextBot {
   async fn ready(&self, _: Context, ready: Ready) {
     let my_name = ready.user.name.as_str();
     let my_discriminator = ready.user.discriminator;
-    println!("Connected as {my_name}#{my_discriminator}!");
+    println!("[Connected as {my_name}#{my_discriminator}]");
   }
 
   /// This is called for each message the bot sees.
@@ -80,9 +126,7 @@ impl EventHandler for TextBot {
         if let Some(sender) = r.get(&msg.channel_id) {
           // If there's already a live session, we just put the message into the
           // channel.
-          if let Err(why) = sender.send(msg.content).await {
-            println!("Error putting message into the session channel: {why:?}");
-          }
+          log_err!(sender.send(msg.content).await);
         } else {
           // When a session isn't found we have to drop our reader and upgrade
           // to holding the writer.
@@ -93,78 +137,23 @@ impl EventHandler for TextBot {
             Entry::Occupied(mut o) => {
               // It's possible for another event to have made a sender between
               // when we first checked and now, so we might be able to send.
-              if let Err(why) = o.get_mut().send(content.to_string()).await {
-                println!(
-                  "Error putting message into the session channel: {why:?}"
-                );
-              }
+              log_err!(o.get_mut().send(msg.content).await);
             }
             Entry::Vacant(v) => {
-              let (sender, mut recver) = mpsc_channel(5);
+              let (sender, recver) = mpsc_channel(5);
               let ses = Arc::clone(&self.sessions);
               let http = Arc::clone(&ctx.http);
-              // TODO: read the game on disk while the map is locked.
-              let mut game = GameData::default();
-              task_spawn(async move {
-                let them = them;
-                let them_str = them.as_str();
-                println!("Spinning up new session for {them_str}.");
-                const TEN_MIN: Duration = Duration::new(60 * 10, 0);
-                while let Ok(Some(message)) =
-                  timeout(TEN_MIN, recver.recv()).await
-                {
-                  if let Err(_) = channel_id.broadcast_typing(&http).await {
-                    // should we report this error?
-                  }
-                  let game_response = game.process_input(message);
-                  if let Err(why) =
-                    channel_id.say(&http, game_response.as_str()).await
-                  {
-                    println!("Error sending message: {why:?}");
-                    // TODO: if we can't speak in the channel that's probably a
-                    // very bad time.
-                  }
-                }
-                println!("Session for {them_str} timed out, shutting down.");
-                let mut writer = ses.write().await;
-                recver.close();
-                while let Some(message) = recver.recv().await {
-                  // There *should* be no messages in the receiver right now,
-                  // but it's potentially possible.
-                  if let Err(_) = channel_id.broadcast_typing(&http).await {
-                    // should we report this error?
-                  }
-                  let game_response = game.process_input(message);
-                  if let Err(why) =
-                    channel_id.say(&http, game_response.as_str()).await
-                  {
-                    println!("Error sending message: {why:?}");
-                  }
-                }
-                writer.remove(&channel_id);
-                // TODO: write the game to disk while the map is locked.
-              });
-              if let Err(why) = sender.send(msg.content).await {
-                println!(
-                  "Error putting message into the session channel: {why:?}"
-                );
-              }
+              // TODO: read game data from disk (if any) while the sessions
+              // mapping is locked.
+              let game = GameData::default();
+              task_spawn(perform_game_session(
+                them, channel_id, recver, game, ses, http,
+              ));
+              log_err!(sender.send(msg.content).await);
               v.insert(sender);
             }
           }
         }
-
-        /*
-        if msg.content == "!ping" {
-          // Sending a message can fail, due to a network error, an
-          // authentication error, or lack of permissions to post in the
-          // channel, so log to stdout when some error happens, with a
-          // description of it.
-          if let Err(why) = msg.channel_id.say(&ctx.http, "Pong!").await {
-            println!("Error sending message: {why:?}");
-          }
-        }
-        */
       }
       _ => return,
     }
