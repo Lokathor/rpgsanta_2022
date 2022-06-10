@@ -1,3 +1,4 @@
 run_discord_bot.sh
 /target
 **/*.rs.bk
+save_data/
