@@ -13,6 +13,7 @@ use serenity::{
 };
 use std::{
   collections::{hash_map::Entry, HashMap},
+  path::{Path, PathBuf},
   sync::Arc,
   time::Duration,
 };
@@ -32,10 +33,12 @@ macro_rules! log_err {
     if let Err(why) = $x {
       let file = file!();
       let line = line!();
-      println!("[{file}:{line}$ {why}]");
+      println!("{file}:{line} ERROR: {why}");
     }
   };
 }
+
+type SessionsMap = Arc<RwLock<HashMap<ChannelId, MspcSender<String>>>>;
 
 /// Manages text adventure sessions over discord.
 ///
@@ -50,50 +53,78 @@ macro_rules! log_err {
 ///   the latest version.
 #[derive(Default)]
 struct TextBot {
-  sessions: Arc<RwLock<HashMap<ChannelId, MspcSender<String>>>>,
+  sessions: SessionsMap,
 }
 
-async fn perform_game_session(
-  name: String, channel_id: ChannelId, mut recver: MspcReceiver<String>,
-  mut game: GameData,
-  sessions_handle: Arc<RwLock<HashMap<ChannelId, MspcSender<String>>>>,
-  http: Arc<Http>,
+#[inline]
+async fn do_one_input(
+  input: String, channel_id: ChannelId, game: &mut GameData, http: &Arc<Http>,
 ) {
-  const TEN_MIN: Duration = Duration::new(60 * 10, 0);
+  drop(channel_id.broadcast_typing(http).await);
+  let response = game.process_input(input);
+  //println!("{response}");
+  log_err!(channel_id.say(http, response).await);
+  let profile_bytes = match Vec::<u8>::try_from(&*game) {
+    Ok(bytes) => bytes,
+    Err(why) => {
+      println!("Couldn't serialize profile data: {why}");
+      return;
+    }
+  };
+  log_err!(store_profile_bytes(channel_id, &profile_bytes));
+}
 
-  let name_str = name.as_str();
-  println!("[Spinning up new session for {name_str}]");
+async fn perform_game(
+  channel_id: ChannelId, mut recver: MspcReceiver<String>, mut game: GameData,
+  sessions: SessionsMap, http: Arc<Http>,
+) {
+  const LIMIT: Duration = Duration::new(60 * 10, 0);
 
-  while let Ok(Some(message)) = timeout(TEN_MIN, recver.recv()).await {
-    // we signal an intent to respond, but if that fails we don't
-    // really care.
-    drop(channel_id.broadcast_typing(&http).await);
-    let game_response = game.process_input(message);
-    log_err!(channel_id.say(&http, game_response.as_str()).await);
+  loop {
+    match timeout(LIMIT, recver.recv()).await {
+      Ok(Some(input)) => {
+        do_one_input(input, channel_id, &mut game, &http).await
+      }
+      Ok(None) => {
+        // This case means the channel was closed? This shouldn't be possible,
+        // because no one else should be deleting our Sender from the
+        // SessionsMap value.
+      }
+      Err(_) => {
+        break;
+      }
+    }
   }
 
-  println!("[Session for {name_str} timed out (or errored), shutting down]");
-  let mut write_lock = sessions_handle.write().await;
-  // close the channel to any new messages
+  let mut write_lock = sessions.write().await;
   recver.close();
-  // pump the channel for all remaining messages (usually none).
-  while let Some(message) = recver.recv().await {
-    drop(channel_id.broadcast_typing(&http).await);
-    let game_response = game.process_input(message);
-    log_err!(channel_id.say(&http, game_response.as_str()).await);
+  while let Some(input) = recver.recv().await {
+    do_one_input(input, channel_id, &mut game, &http).await
   }
-  // TODO: write the game to disk while the sessions map is locked.
   write_lock.remove(&channel_id);
+}
+
+fn save_path_for_id(ChannelId(id): ChannelId) -> PathBuf {
+  Path::new("save_data").join(format!("{id}.data"))
+}
+fn load_profile_bytes(channel_id: ChannelId) -> std::io::Result<Vec<u8>> {
+  std::fs::read(save_path_for_id(channel_id))
+}
+fn store_profile_bytes(
+  channel_id: ChannelId, bytes: &[u8],
+) -> std::io::Result<()> {
+  let p = save_path_for_id(channel_id);
+  std::fs::create_dir_all(p.parent().unwrap_or(Path::new(""))).ok();
+  std::fs::write(p, bytes)
 }
 
 #[async_trait]
 impl EventHandler for TextBot {
-  /// This is called when a shard is booted, and a READY payload is sent by
-  /// Discord.
   async fn ready(&self, _: Context, ready: Ready) {
-    let my_name = ready.user.name.as_str();
-    let my_discriminator = ready.user.discriminator;
-    println!("[Connected as {my_name}#{my_discriminator}]");
+    let current_user = ready.user;
+    let current_name = current_user.name.as_str();
+    let current_discriminator = current_user.discriminator;
+    println!("Connected as {current_name}#{current_discriminator}!");
   }
 
   /// This is called for each message the bot sees.
@@ -103,87 +134,64 @@ impl EventHandler for TextBot {
   /// * Events are handled async using a thread pool, so multiple messages can
   ///   be in flight at the same time.
   async fn message(&self, ctx: Context, msg: Message) {
-    // Currently the bot only supports private message interactions. All other
-    // messages are ignored. This is not a fundamental limit, just a logistical
-    // one.
-    match msg.channel(&ctx.http).await {
-      Ok(Channel::Private(priv_chan)) => {
-        let recipient = &priv_chan.recipient;
-        let recipient_name = recipient.name.as_str();
-        let recipient_discrim = recipient.discriminator;
-        let them = format!("{recipient_name}#{recipient_discrim}");
-        let them_str = them.as_str();
-        let they_spoke = recipient_discrim == msg.author.discriminator
-          && recipient_name == msg.author.name.as_str();
-        let msg_dir = if they_spoke { ">" } else { "<" };
-        let content = msg.content.as_str();
-        println!("{them_str}{msg_dir} {content}");
-        if !they_spoke {
-          return;
-        }
-        //
-        let r: RwLockReadGuard<_> = self.sessions.read().await;
-        if let Some(sender) = r.get(&msg.channel_id) {
-          // If there's already a live session, we just put the message into the
-          // channel.
+    // Ignore all message events from bots, including our own.
+    if msg.author.bot {
+      return;
+    }
+    // Currently we only run games within private messages
+    let game_is_allowed = match msg.channel(&ctx.http).await {
+      Ok(Channel::Private(_)) => true,
+      _ => false,
+    };
+    if !game_is_allowed {
+      return;
+    }
+
+    //let author = msg.author;
+    //let author_name = author.name.as_str();
+    //let author_discriminator = author.discriminator;
+    //let content = msg.content.as_str();
+    //println!("{author_name}#{author_discriminator}$ {content}");
+
+    let channel_id = msg.channel_id;
+    let r = self.sessions.read().await;
+    if let Some(sender) = r.get(&channel_id) {
+      log_err!(sender.send(msg.content).await);
+    } else {
+      drop(r);
+      match self.sessions.write().await.entry(channel_id) {
+        Entry::Occupied(o) => {
+          let sender = o.get();
           log_err!(sender.send(msg.content).await);
-        } else {
-          // When a session isn't found we have to drop our reader and upgrade
-          // to holding the writer.
-          drop(r);
-          let channel_id = msg.channel_id;
-          let mut w: RwLockWriteGuard<_> = self.sessions.write().await;
-          match w.entry(channel_id) {
-            Entry::Occupied(mut o) => {
-              // It's possible for another event to have made a sender between
-              // when we first checked and now, so we might be able to send.
-              log_err!(o.get_mut().send(msg.content).await);
-            }
-            Entry::Vacant(v) => {
-              let (sender, recver) = mpsc_channel(5);
-              let ses = Arc::clone(&self.sessions);
-              let http = Arc::clone(&ctx.http);
-              // TODO: read game data from disk (if any) while the sessions
-              // mapping is locked.
-              let game = GameData::default();
-              task_spawn(perform_game_session(
-                them, channel_id, recver, game, ses, http,
-              ));
-              log_err!(sender.send(msg.content).await);
-              v.insert(sender);
-            }
-          }
+        }
+        Entry::Vacant(v) => {
+          let (sender, recver) = mpsc_channel(5);
+          let ses = Arc::clone(&self.sessions);
+          let http = Arc::clone(&ctx.http);
+          let bytes = load_profile_bytes(channel_id).unwrap_or_default();
+          let game = GameData::try_from(bytes.as_ref()).unwrap_or_default();
+          task_spawn(perform_game(channel_id, recver, game, ses, http));
+          log_err!(sender.send(msg.content).await);
+          v.insert(sender);
         }
       }
-      _ => return,
     }
   }
 }
 
 #[tokio::main]
 async fn main() {
-  // Configure the client with your Discord bot token in the environment.
   let token =
     std::env::var("DISCORD_TOKEN").expect("Expected a `DISCORD_TOKEN` value");
-  // Set gateway intents, which decides what events the bot will be notified
-  // about
+
   let intents = GatewayIntents::GUILD_MESSAGES
     | GatewayIntents::DIRECT_MESSAGES
     | GatewayIntents::MESSAGE_CONTENT;
 
-  // Create a new instance of the Client, logging in as a bot. This will
-  // automatically prepend your bot token with "Bot ", which is a requirement
-  // by Discord for bot users.
   let mut client = Client::builder(&token, intents)
     .event_handler(TextBot::default())
     .await
     .expect("Err creating client");
 
-  // Finally, start a single shard, and start listening to events.
-  //
-  // Shards will automatically attempt to reconnect, and will perform
-  // exponential backoff until it reconnects.
-  if let Err(why) = client.start().await {
-    println!("Client start error: {why:?}");
-  }
+  log_err!(client.start().await);
 }

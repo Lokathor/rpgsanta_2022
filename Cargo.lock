@@ -656,6 +656,7 @@ dependencies = [
  "bincode",
  "serde",
  "serenity",
+ "tinyvec",
  "tokio",
 ]
 
