@@ -654,6 +654,7 @@ name = "rpgsanta_2022"
 version = "0.1.0"
 dependencies = [
  "bincode",
+ "libc",
  "serde",
  "serenity",
  "tinyvec",

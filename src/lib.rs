@@ -19,7 +19,7 @@ impl TryFrom<&GameData> for Vec<u8> {
 }
 
 impl GameData {
-  pub fn process_input(&mut self, _line: String) -> String {
+  pub fn process_input(&mut self, _input: &str) -> String {
     self.message_count += 1;
     format!("{}", self.message_count)
   }

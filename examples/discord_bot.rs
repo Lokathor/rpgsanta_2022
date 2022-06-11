@@ -58,7 +58,7 @@ struct TextBot {
 
 #[inline]
 async fn do_one_input(
-  input: String, channel_id: ChannelId, game: &mut GameData, http: &Arc<Http>,
+  input: &str, channel_id: ChannelId, game: &mut GameData, http: &Arc<Http>,
 ) {
   drop(channel_id.broadcast_typing(http).await);
   let response = game.process_input(input);
@@ -83,7 +83,7 @@ async fn perform_game(
   loop {
     match timeout(LIMIT, recver.recv()).await {
       Ok(Some(input)) => {
-        do_one_input(input, channel_id, &mut game, &http).await
+        do_one_input(&input, channel_id, &mut game, &http).await
       }
       Ok(None) => {
         // This case means the channel was closed? This shouldn't be possible,
@@ -99,7 +99,7 @@ async fn perform_game(
   let mut write_lock = sessions.write().await;
   recver.close();
   while let Some(input) = recver.recv().await {
-    do_one_input(input, channel_id, &mut game, &http).await
+    do_one_input(&input, channel_id, &mut game, &http).await
   }
   write_lock.remove(&channel_id);
 }
